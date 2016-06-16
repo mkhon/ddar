@@ -16,6 +16,7 @@
 
 import binascii, collections, errno, hashlib, itertools, fcntl, os, os.path
 import select, stat, string, sqlite3, subprocess, sys, tempfile, time
+import tarfile, StringIO, pwd, grp
 
 import synctus.ddar_pb2, synctus.dds
 import synctus.netstring as netstring
@@ -154,14 +155,21 @@ class Archive(object):
     def __init__(self, dirname, auto_create=False):
         self.dirname = dirname
         if self.dirname == '-' and auto_create:
-            self.streaming = True
+            self.stream = tarfile.open(fileobj=sys.stdout, mode="w|")
+            self.tarinfo = tarfile.TarInfo()
+            self.tarinfo.mode = 0644
+            self.tarinfo.uid = os.getuid()
+            self.tarinfo.uname = pwd.getpwuid(self.tarinfo.uid).pw_name
+            self.tarinfo.gid = os.getgid()
+            self.tarinfo.gname = grp.getgrgid(self.tarinfo.gid).gr_name
             temp_fd, self.dbname = tempfile.mkstemp(prefix='db')
             os.close(temp_fd)
+            os.chmod(self.dbname, 0644)
             self._create()
             self._connectdb()
             return
 
-        self.streaming = False
+        self.stream = None
         self.dbname = os.path.join(self.dirname, 'db')
 
         if not os.path.exists(self.dirname):
@@ -197,13 +205,20 @@ class Archive(object):
     def _stream_file(self, name, data=None, datafile=None):
         if verbose:
             if datafile:
-                print "{0} ({1})".format(name, datafile)
+                print >>sys.stderr, "{0} ({1})".format(name, datafile)
             else:
-                print name
-        # TODO
+                print >>sys.stderr, name
+        if datafile:
+            self.stream.add(datafile, arcname=name)
+        else:
+            tarinfo = self.tarinfo
+            tarinfo.name = name
+            tarinfo.size = len(data)
+            tarinfo.mtime = time.time()
+            self.stream.addfile(tarinfo, StringIO.StringIO(data))
 
     def _read_format_file(self, name, size_limit=1024):
-        if self.streaming:
+        if self.stream:
             raise ConsoleError('Can not read format file %s in streaming mode' % name)
         f = open(os.path.join(self.dirname, 'format', name), 'r')
         try:
@@ -214,12 +229,12 @@ class Archive(object):
 
     def _write_format_file(self, name, data):
         filename = os.path.join('format', name)
-        if self.streaming:
+        if self.stream:
             self._stream_file(filename, data=data)
             return
         filename = os.path.join(self.dirname, filename)
         if verbose:
-            print filename
+            print >>sys.stderr, filename
         f = open(filename, 'w')
         try:
             f.write(data)
@@ -227,7 +242,7 @@ class Archive(object):
             f.close()
 
     def _create(self):
-        if not self.streaming:
+        if not self.stream:
             os.mkdir(self.dirname)
             os.mkdir(os.path.join(self.dirname, 'format'))
             os.mkdir(os.path.join(self.dirname, 'objects'))
@@ -282,12 +297,14 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
                 raise
 
     def close(self):
-        if self.streaming:
+        if self.stream:
             self._stream_file('db', datafile=self.dbname)
             os.unlink(self.dbname)
+            self.stream.close()
+            self.stream = None
         else:
             if verbose:
-                print self.dbname
+                print >>self.stderr, self.dbname
 
     @staticmethod
     def _have_chunk(cursor, h):
@@ -316,7 +333,7 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
 
         if not self._have_chunk(cursor, h).reply:
             assert(data is not None)
-            if self.streaming:
+            if self.stream:
                 self._stream_file(self._object_filename(h, relative=True), data=data)
             else:
                 object_filename = self._object_filename(h)
@@ -330,7 +347,7 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
                     temp.close()
                 os.rename(temp_name, object_filename)
                 if verbose:
-                    print object_filename
+                    print >>sys.stderr, object_filename
 
         h_blob = buffer(h)
         cursor.execute('INSERT INTO chunk ' +
