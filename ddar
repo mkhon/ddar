@@ -16,7 +16,7 @@
 
 import binascii, collections, errno, hashlib, itertools, fcntl, os, os.path
 import select, stat, string, sqlite3, subprocess, sys, tempfile, time
-import tarfile, StringIO, pwd, grp
+import tarfile, StringIO, pwd, grp, shutil
 
 import synctus.ddar_pb2, synctus.dds
 import synctus.netstring as netstring
@@ -152,9 +152,10 @@ class _WorkPipeline(object):
         self._flush()
 
 class Archive(object):
-    def __init__(self, dirname, auto_create=False):
+    def __init__(self, dirname, auto_create=False, dbname=None):
         self.dirname = dirname
         if self.dirname == '-' and auto_create:
+            # output stream
             self.stream = tarfile.open(fileobj=sys.stdout, mode="w|")
             self.tarinfo = tarfile.TarInfo()
             self.tarinfo.mode = 0644
@@ -162,10 +163,17 @@ class Archive(object):
             self.tarinfo.uname = pwd.getpwuid(self.tarinfo.uid).pw_name
             self.tarinfo.gid = os.getgid()
             self.tarinfo.gname = grp.getgrgid(self.tarinfo.gid).gr_name
+
+            # db
             temp_fd, self.dbname = tempfile.mkstemp(prefix='db')
             os.close(temp_fd)
             os.chmod(self.dbname, 0644)
-            self._create()
+            if dbname:
+                shutil.copyfile(dbname, self.dbname)
+                self.db_mtime = os.path.getmtime(self.dbname)
+            else:
+                self.db_mtime = 0
+                self._create()
             self._connectdb()
             return
 
@@ -298,13 +306,14 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
 
     def close(self):
         if self.stream:
-            self._stream_file('db', datafile=self.dbname)
+            if os.path.getmtime(self.dbname) > self.db_mtime:
+                self._stream_file('db', datafile=self.dbname)
             os.unlink(self.dbname)
             self.stream.close()
             self.stream = None
         else:
             if verbose:
-                print >>self.stderr, self.dbname
+                print >>sys.stderr, self.dbname
 
     @staticmethod
     def _have_chunk(cursor, h):
@@ -1156,7 +1165,7 @@ ddar_arg_spec = {
     'pos_arg_names': [ 'member' ],
     'bool_options': set('ctxdv') | set([ 'fsck', 'force-stdout', 'server',
                                         'sender', 'sha256sum' ]),
-    'arg_options': set([ 'f', 'N', 'rsh', 'pipeline-size' ]),
+    'arg_options': set([ 'D', 'f', 'N', 'rsh', 'pipeline-size' ]),
     'exclusive_options': set([frozenset([ 'c', 't', 'x', 'd', 'fsck',
                                           'sha256sum' ])])
 }
@@ -1222,7 +1231,7 @@ def main():
 
             if args['pipeline-size'] is None:
                 args['pipeline-size'] = '0'
-            archive = Archive(args['f'], auto_create=True)
+            archive = Archive(args['f'], auto_create=True, dbname=args['D'])
             
             host, filename = args['member'][0].split(':')
             if filename[0] == '!':
@@ -1235,7 +1244,7 @@ def main():
             source_ipc = RshIPC(cmd=rsh, host=host, args=remote_args)
         else:
             source_ipc = StdIPC() if args['server'] else None
-            archive = Archive(args['f'], auto_create=args['c'])
+            archive = Archive(args['f'], auto_create=args['c'], dbname=args['D'])
             if args['pipeline-size'] is None:
                 args['pipeline-size'] = '0'
 
@@ -1273,12 +1282,18 @@ Create or add to an archive:
     ddar [-]c [-f] archive member [member...]
     ddar [-]c [-f] [server:]archive [-N member-name] < file
     ddar [-]c [-f] [server:]archive [-N member-name] member
+    ddar [-]c [-f] - [-D db] [-N member-name] [member...]
+    ddar [-]c [-f] - [-D db] [-N member-name] < file
     ddar [-]c [-f] archive server:member [-N member-name]
     ddar [-]c [-f] archive server:!cmd [-N member-name]
 
     If member-name is unspecified, ddar will use the supplied filename
     as the member name, or if none is available then it will create a
     suitable name based on the current date.
+
+    If archive name is '-' ddar will stream archive contents to stdout
+    in tar format. -D argument can be used to specify starting point
+    (starting database).
 
 Extract from an archive:
     ddar [-]x [options] [-f] archive > file  # extract the most recent member
