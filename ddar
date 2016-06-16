@@ -36,6 +36,9 @@ DEFAULT_REMOTE_PIPELINE_SIZE = '8' # string for cmdline equiv.
 PROTOCOL_MAGIC = "ddar"
 PROTOCOL_VERSION = "1" # ASCII decimal string for readability
 
+# Global verbosity level
+verbose = False
+
 def _sysread(fileobj, bufsize=4096):
     '''Read up to bufsize bytes, whatever is available, blocking until at least
     something is available. This is different from fileobj.read() because it
@@ -150,6 +153,16 @@ class _WorkPipeline(object):
 class Archive(object):
     def __init__(self, dirname, auto_create=False):
         self.dirname = dirname
+        if self.dirname == '-' and auto_create:
+            self.streaming = True
+            temp_fd, self.dbname = tempfile.mkstemp(prefix='db')
+            os.close(temp_fd)
+            self._create()
+            self._connectdb()
+            return
+
+        self.streaming = False
+        self.dbname = os.path.join(self.dirname, 'db')
 
         if not os.path.exists(self.dirname):
             if auto_create:
@@ -161,49 +174,68 @@ class Archive(object):
                                self.dirname)
 
         try:
-            format_name = self._read_small_file(self._format_filename('name'))
+            format_name = self._read_format_file('name')
         except:
             raise ConsoleError('%s is not a ddar directory' % self.dirname)
         else:
             if format_name.lstrip().rstrip() != 'ddar':
                 raise ConsoleError('%s is not a ddar directory' % self.dirname)
 
-        version = self._read_small_file(self._format_filename('version'))
+        version = self._read_format_file('version')
         version = version.lstrip().rstrip()
         if version != '1':
             raise ConsoleError('%s uses ddar archive version %s but only' +
                                'version 1 is supported' % self.dirname)
 
-        self.db = sqlite3.connect(os.path.join(self.dirname, 'db'))
+        self._connectdb()
+
+    def _connectdb(self):
+        self.db = sqlite3.connect(self.dbname)
         self.db.text_factory = str
         self.db.execute('PRAGMA foreign_keys = ON')
 
-    @staticmethod
-    def _read_small_file(name, size_limit=1024):
-        f = open(name, 'r')
+    def _stream_file(self, name, data=None, datafile=None):
+        if verbose:
+            if datafile:
+                print "{0} ({1})".format(name, datafile)
+            else:
+                print name
+        # TODO
+
+    def _read_format_file(self, name, size_limit=1024):
+        if self.streaming:
+            raise ConsoleError('Can not read format file %s in streaming mode' % name)
+        f = open(os.path.join(self.dirname, 'format', name), 'r')
         try:
             data = f.read(size_limit)
         finally:
             f.close()
         return data
 
-    @staticmethod
-    def _write_small_file(name, data):
-        f = open(name, 'w')
+    def _write_format_file(self, name, data):
+        filename = os.path.join('format', name)
+        if self.streaming:
+            self._stream_file(filename, data=data)
+            return
+        filename = os.path.join(self.dirname, filename)
+        if verbose:
+            print filename
+        f = open(filename, 'w')
         try:
             f.write(data)
         finally:
             f.close()
 
     def _create(self):
-        os.mkdir(self.dirname)
-        os.mkdir(os.path.join(self.dirname, 'format'))
-        os.mkdir(os.path.join(self.dirname, 'objects'))
+        if not self.streaming:
+            os.mkdir(self.dirname)
+            os.mkdir(os.path.join(self.dirname, 'format'))
+            os.mkdir(os.path.join(self.dirname, 'objects'))
 
-        self._write_small_file(self._format_filename('name'), "ddar\n")
-        self._write_small_file(self._format_filename('version'), "1\n")
+        self._write_format_file('name', "ddar\n")
+        self._write_format_file('version', "1\n")
 
-        db = sqlite3.connect(os.path.join(self.dirname, 'db'))
+        db = sqlite3.connect(self.dbname)
         c = db.cursor()
         c.execute('''
 CREATE TABLE member (id INTEGER PRIMARY KEY,
@@ -228,13 +260,16 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
         db.commit()
         db.close()
 
-    def _object_filename(self, h):
+    def _object_filename(self, h, relative = False):
         h = binascii.hexlify(h)
-        return os.path.join(self.dirname, 'objects', h[0:2], h[2:])
+        filename = os.path.join('objects', h[0:2], h[2:])
+        if not relative:
+            filename = os.path.join(self.dirname, filename)
+        return filename
 
-    def _makedirs(self, object_filename):
+    def _makedirs(self, dirname):
         try:
-            os.makedirs(os.path.dirname(object_filename))
+            os.makedirs(dirname)
         except OSError, e:
             if e.errno != errno.EEXIST:
                 raise
@@ -246,10 +281,13 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
             if e.errno != errno.ENOTEMPTY:
                 raise
 
-    def _format_filename(self, n):
-        return os.path.join(self.dirname, 'format', n)
-
-    def close(self): pass
+    def close(self):
+        if self.streaming:
+            self._stream_file('db', datafile=self.dbname)
+            os.unlink(self.dbname)
+        else:
+            if verbose:
+                print self.dbname
 
     @staticmethod
     def _have_chunk(cursor, h):
@@ -278,16 +316,21 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
 
         if not self._have_chunk(cursor, h).reply:
             assert(data is not None)
-            object_filename = self._object_filename(h)
-            object_dir = os.path.dirname(object_filename)
-            self._makedirs(object_filename)
-            temp_fd, temp_name = tempfile.mkstemp(dir=object_dir)
-            temp = os.fdopen(temp_fd, 'w')
-            try:
-                temp.write(data)
-            finally:
-                temp.close()
-            os.rename(temp_name, object_filename)
+            if self.streaming:
+                self._stream_file(self._object_filename(h, relative=True), data=data)
+            else:
+                object_filename = self._object_filename(h)
+                object_dir = os.path.dirname(object_filename)
+                self._makedirs(object_dir)
+                temp_fd, temp_name = tempfile.mkstemp(dir=object_dir)
+                temp = os.fdopen(temp_fd, 'w')
+                try:
+                    temp.write(data)
+                finally:
+                    temp.close()
+                os.rename(temp_name, object_filename)
+                if verbose:
+                    print object_filename
 
         h_blob = buffer(h)
         cursor.execute('INSERT INTO chunk ' +
@@ -1094,7 +1137,7 @@ class StdIPC(object):
 
 ddar_arg_spec = {
     'pos_arg_names': [ 'member' ],
-    'bool_options': set('ctxd') | set([ 'fsck', 'force-stdout', 'server',
+    'bool_options': set('ctxdv') | set([ 'fsck', 'force-stdout', 'server',
                                         'sender', 'sha256sum' ]),
     'arg_options': set([ 'f', 'N', 'rsh', 'pipeline-size' ]),
     'exclusive_options': set([frozenset([ 'c', 't', 'x', 'd', 'fsck',
@@ -1115,8 +1158,12 @@ def main():
             raise OptionError('no member specified')
         if args['N'] and not args['c']:
             raise OptionError('option -N not valid except in create mode')
+        if args['f'] == '-' and not args['c']:
+            raise OptionError('stdout archive not valid except in create mode')
         if args['server'] and args['sender']:
             raise OptionError('--server and --sender cannot both be set')
+        global verbose
+        verbose = args['v']
 
         if len(args['member']) > 1 and (':' in args['f'] or args['server']):
             raise OptionError('can only add one item at once to remote archive')
