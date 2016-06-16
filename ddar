@@ -208,6 +208,12 @@ class Archive(object):
         self.db.text_factory = str
         self.db.execute('PRAGMA foreign_keys = ON')
 
+        # a connection to detect db changes
+        if self.stream:
+            self.db_check = sqlite3.connect(self.dbname)
+            self.db_version = self.db_check.execute('PRAGMA data_version').fetchone()[0]
+            print >>sys.stderr, "db version {0}".format(self.db_version)
+
     def _stream_file(self, name, data=None, datafile=None):
         if verbose:
             if datafile:
@@ -304,7 +310,11 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
 
     def close(self):
         if self.stream:
-            self._stream_file('db', datafile=self.dbname)
+            db_version = self.db_check.execute('PRAGMA data_version').fetchone()[0]
+            self.db_check.close()
+            print >>sys.stderr, "new db version {0}".format(db_version)
+            if db_version != self.db_version:
+                self._stream_file('db', datafile=self.dbname)
             os.unlink(self.dbname)
             self.stream.close()
             self.stream = None
