@@ -170,9 +170,7 @@ class Archive(object):
             os.chmod(self.dbname, 0644)
             if dbname:
                 shutil.copyfile(dbname, self.dbname)
-                self.db_mtime = os.path.getmtime(self.dbname)
             else:
-                self.db_mtime = 0
                 self._create()
             self._connectdb()
             return
@@ -306,8 +304,7 @@ CREATE TABLE chunk (member_id INTEGER NOT NULL,
 
     def close(self):
         if self.stream:
-            if os.path.getmtime(self.dbname) > self.db_mtime:
-                self._stream_file('db', datafile=self.dbname)
+            self._stream_file('db', datafile=self.dbname)
             os.unlink(self.dbname)
             self.stream.close()
             self.stream = None
